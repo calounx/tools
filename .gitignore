@@ -1,0 +1,23 @@
+# Fail2ban report exports
+/tmp/fail2ban-reports/
+*.txt
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# Claude Code
+.claude/
