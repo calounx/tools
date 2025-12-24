@@ -25,7 +25,13 @@ A comprehensive, user-friendly bash script for generating detailed fail2ban repo
 
 1. Download the script:
 ```bash
-wget https://raw.githubusercontent.com/calounx/fail2ban-report/main/fail2ban-report.sh
+wget https://raw.githubusercontent.com/calounx/tools/master/fail2ban-report.sh
+```
+
+Or clone the entire repository:
+```bash
+git clone https://github.com/calounx/tools.git
+cd tools
 ```
 
 2. Make it executable:

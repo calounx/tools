@@ -26,6 +26,28 @@ SCRIPT_NAME=$(basename "$0")
 SCRIPT_VERSION="1.0.0"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
 EXPORT_DIR="/tmp/fail2ban-reports"
+F2B_TIMEOUT=10  # Timeout for fail2ban-client commands in seconds
+
+# Cleanup trap
+TEMP_FILES=()
+
+cleanup() {
+    local exit_code=$?
+
+    # Clean up temporary files
+    for file in "${TEMP_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm -f "$file" 2>/dev/null || true
+        fi
+    done
+
+    # Restore terminal state if needed
+    tput cnorm 2>/dev/null || true  # Show cursor
+
+    exit "$exit_code"
+}
+
+trap cleanup EXIT INT TERM
 
 # Color definitions
 if [[ -t 1 ]]; then
@@ -42,6 +64,8 @@ if [[ -t 1 ]]; then
     COLOR_BOLD_GREEN='\033[1;32m'
     COLOR_BOLD_YELLOW='\033[1;33m'
     COLOR_BOLD_BLUE='\033[1;34m'
+    COLOR_BOLD_MAGENTA='\033[1;35m'
+    COLOR_BOLD_CYAN='\033[1;36m'
 else
     COLOR_RESET=''
     COLOR_BOLD=''
@@ -56,6 +80,8 @@ else
     COLOR_BOLD_GREEN=''
     COLOR_BOLD_YELLOW=''
     COLOR_BOLD_BLUE=''
+    COLOR_BOLD_MAGENTA=''
+    COLOR_BOLD_CYAN=''
 fi
 
 ################################################################################
@@ -103,9 +129,17 @@ print_info() {
 
 # Check if running with sufficient privileges
 check_privileges() {
-    if [[ $EUID -ne 0 ]] && ! sudo -n true 2>/dev/null; then
-        print_error "This script requires root privileges or sudo access"
+    # Try to run actual command we need instead of generic sudo check
+    if ! f2b_cmd ping &>/dev/null; then
+        print_error "This script requires privileges to run fail2ban-client"
         print_info "Please run with: sudo $SCRIPT_NAME"
+
+        # Provide helpful diagnostic
+        if [[ $EUID -ne 0 ]]; then
+            if command -v sudo &>/dev/null; then
+                print_info "Or configure sudo access for fail2ban-client"
+            fi
+        fi
         exit 1
     fi
 }
@@ -135,12 +169,23 @@ check_fail2ban_running() {
     fi
 }
 
-# Execute fail2ban-client command with proper privileges
+# Execute fail2ban-client command with proper privileges and timeout
 f2b_cmd() {
-    if [[ $EUID -eq 0 ]]; then
-        fail2ban-client "$@"
+    local cmd_timeout="$F2B_TIMEOUT"
+
+    if command -v timeout &>/dev/null; then
+        if [[ $EUID -eq 0 ]]; then
+            timeout "$cmd_timeout" fail2ban-client "$@"
+        else
+            timeout "$cmd_timeout" sudo fail2ban-client "$@"
+        fi
     else
-        sudo fail2ban-client "$@"
+        # Fallback without timeout command
+        if [[ $EUID -eq 0 ]]; then
+            fail2ban-client "$@"
+        else
+            sudo fail2ban-client "$@"
+        fi
     fi
 }
 
@@ -380,7 +425,7 @@ display_ban_history() {
 
     local total_bans today_bans
     total_bans=$(grep -c "Ban" "$FAIL2BAN_LOG" 2>/dev/null || echo "0")
-    today_bans=$(grep "Ban" "$FAIL2BAN_LOG" | grep "$(date +%Y-%m-%d)" | wc -l 2>/dev/null || echo "0")
+    today_bans=$(grep "Ban" "$FAIL2BAN_LOG" | grep -c "$(date +%Y-%m-%d)" 2>/dev/null || echo "0")
 
     print_color "${COLOR_BOLD}" "Total Bans (all time):     ${COLOR_RED}${total_bans}"
     print_color "${COLOR_BOLD}" "Bans Today:                ${COLOR_YELLOW}${today_bans}"
@@ -460,21 +505,55 @@ export_report() {
     timestamp=$(date +%Y%m%d_%H%M%S)
 
     # Create export directory if it doesn't exist
-    mkdir -p "$EXPORT_DIR"
+    if [[ ! -d "$EXPORT_DIR" ]]; then
+        mkdir -p "$EXPORT_DIR" || {
+            print_error "Failed to create export directory: $EXPORT_DIR"
+            return 1
+        }
+        chmod 700 "$EXPORT_DIR"  # Owner only
+    fi
 
-    # If no filename provided, generate one
-    if [[ -z "$output_file" ]]; then
+    # Sanitize filename
+    if [[ -n "$output_file" ]]; then
+        # Check for path traversal
+        if [[ "$output_file" == *".."* ]]; then
+            print_error "Path traversal detected in filename"
+            return 1
+        fi
+
+        # Ensure absolute path or relative to EXPORT_DIR
+        if [[ "$output_file" != /* ]]; then
+            output_file="${EXPORT_DIR}/${output_file}"
+        fi
+
+        # Verify write permissions
+        local dir
+        dir=$(dirname "$output_file")
+        if [[ ! -w "$dir" ]]; then
+            print_error "No write permission to directory: $dir"
+            return 1
+        fi
+
+        # Blacklist critical paths
+        case "$output_file" in
+            /etc/*|/boot/*|/sys/*|/proc/*|/dev/*)
+                print_error "Cannot write to system directory"
+                return 1
+                ;;
+        esac
+    else
         output_file="${EXPORT_DIR}/fail2ban_report_${timestamp}.txt"
     fi
 
     print_info "Generating report..."
 
-    {
-        echo "FAIL2BAN REPORT"
-        echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "========================================"
-        echo
+    # Set secure umask for file creation
+    local old_umask
+    old_umask=$(umask)
+    umask 077  # Create file as 0600 (owner only)
 
+    # Run in subshell to avoid polluting global color variables
+    (
         # Disable colors for file export
         COLOR_RESET=''
         COLOR_BOLD=''
@@ -491,13 +570,19 @@ export_report() {
         COLOR_BOLD_BLUE=''
         COLOR_BOLD_CYAN=''
 
+        echo "FAIL2BAN REPORT"
+        echo "Generated: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "========================================"
+        echo
+
         display_system_status
         display_statistics
         display_active_jails
         display_banned_ips
         display_ban_history
+    ) > "$output_file"
 
-    } > "$output_file"
+    umask "$old_umask"
 
     print_success "Report exported to: $output_file"
 
