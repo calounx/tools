@@ -27,6 +27,7 @@ SCRIPT_VERSION="1.0.0"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
 EXPORT_DIR="/tmp/fail2ban-reports"
 F2B_TIMEOUT=10  # Timeout for fail2ban-client commands in seconds
+MAX_LOG_FILES=5  # Maximum number of rotated log files to scan (including current)
 
 # Cleanup trap
 TEMP_FILES=()
@@ -189,6 +190,68 @@ f2b_cmd() {
     fi
 }
 
+# Discover all available fail2ban log files (current + rotated)
+get_log_files() {
+    local log_files=()
+    local base_log="$FAIL2BAN_LOG"
+
+    # Add main log file if it exists
+    if [[ -f "$base_log" && -r "$base_log" ]]; then
+        log_files+=("$base_log")
+    fi
+
+    # Find rotated logs (fail2ban.log.1, fail2ban.log.2, etc.)
+    local i=1
+    while [[ ${#log_files[@]} -lt $MAX_LOG_FILES ]]; do
+        if [[ -f "${base_log}.${i}" && -r "${base_log}.${i}" ]]; then
+            log_files+=("${base_log}.${i}")
+        elif [[ -f "${base_log}.${i}.gz" && -r "${base_log}.${i}.gz" ]]; then
+            log_files+=("${base_log}.${i}.gz")
+        else
+            break
+        fi
+        ((i++))
+    done
+
+    # Output found log files
+    printf '%s\n' "${log_files[@]}"
+}
+
+# Read content from log file (handles both regular and compressed .gz files)
+read_log_file() {
+    local log_file=$1
+
+    if [[ "$log_file" == *.gz ]]; then
+        # Compressed file - use zcat/gzcat
+        if command -v zcat &>/dev/null; then
+            zcat "$log_file" 2>/dev/null
+        elif command -v gzcat &>/dev/null; then
+            gzcat "$log_file" 2>/dev/null
+        else
+            print_warning "Cannot read compressed file $log_file: zcat/gzcat not available"
+            return 1
+        fi
+    else
+        # Regular file
+        cat "$log_file" 2>/dev/null
+    fi
+}
+
+# Get ban entries from all log files
+get_all_ban_entries() {
+    local log_files
+    mapfile -t log_files < <(get_log_files)
+
+    if [[ ${#log_files[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    # Read and grep all log files
+    for log_file in "${log_files[@]}"; do
+        read_log_file "$log_file" | grep "Ban" 2>/dev/null || true
+    done
+}
+
 ################################################################################
 # Core Functions
 ################################################################################
@@ -242,10 +305,32 @@ display_system_status() {
     print_color "${COLOR_BOLD}" "Version:      ${COLOR_GREEN}${version}"
     print_success "fail2ban is installed and running"
 
-    if [[ -f "$FAIL2BAN_LOG" ]]; then
-        local log_size
-        log_size=$(du -h "$FAIL2BAN_LOG" 2>/dev/null | cut -f1 || echo "Unknown")
-        print_color "${COLOR_BOLD}" "Log file:     ${COLOR_WHITE}${FAIL2BAN_LOG} (${log_size})"
+    # Display log file information
+    local log_files
+    mapfile -t log_files < <(get_log_files)
+    local log_count=${#log_files[@]}
+
+    if [[ $log_count -gt 0 ]]; then
+        local main_log="${log_files[0]}"
+        local main_size
+        main_size=$(du -h "$main_log" 2>/dev/null | cut -f1 || echo "Unknown")
+
+        print_color "${COLOR_BOLD}" "Log files:    ${COLOR_CYAN}${log_count}${COLOR_RESET} file(s) found (max: ${MAX_LOG_FILES})"
+        print_color "${COLOR_BOLD}" "Main log:     ${COLOR_WHITE}${main_log} (${main_size})"
+
+        if [[ $log_count -gt 1 ]]; then
+            print_color "${COLOR_BOLD}" "Rotated logs: ${COLOR_CYAN}$((log_count - 1))${COLOR_RESET} file(s)"
+            for ((i=1; i<log_count; i++)); do
+                local log_file="${log_files[$i]}"
+                local size
+                size=$(du -h "$log_file" 2>/dev/null | cut -f1 || echo "?")
+                local basename
+                basename=$(basename "$log_file")
+                print_color "${COLOR_WHITE}" "              - ${basename} (${size})"
+            done
+        fi
+    else
+        print_warning "No log files found at $FAIL2BAN_LOG"
     fi
 
     echo
@@ -387,16 +472,25 @@ display_recent_bans() {
 
     print_header "RECENTLY BANNED IPs (Last $count)"
 
-    if [[ ! -f "$FAIL2BAN_LOG" ]]; then
-        print_error "Log file not found: $FAIL2BAN_LOG"
+    # Get log file count for display
+    local log_files
+    mapfile -t log_files < <(get_log_files)
+    local log_count=${#log_files[@]}
+
+    if [[ $log_count -eq 0 ]]; then
+        print_error "No log files found"
         return 1
     fi
 
+    print_color "${COLOR_BOLD}" "Scanning ${COLOR_CYAN}${log_count}${COLOR_RESET} log file(s)"
     print_color "${COLOR_BOLD}" "Format: [Timestamp] [Jail] IP Address"
     print_color "${COLOR_BLUE}" "$(printf '%.0s─' {1..80})"
 
-    if grep -q "Ban" "$FAIL2BAN_LOG" 2>/dev/null; then
-        grep "Ban" "$FAIL2BAN_LOG" | tail -n "$count" | while IFS= read -r line; do
+    local ban_entries
+    ban_entries=$(get_all_ban_entries)
+
+    if [[ -n "$ban_entries" ]]; then
+        echo "$ban_entries" | tail -n "$count" | while IFS= read -r line; do
             # Extract timestamp, jail, and IP
             local timestamp jail ip
             timestamp=$(echo "$line" | awk '{print $1, $2}')
@@ -408,7 +502,7 @@ display_recent_bans() {
             fi
         done
     else
-        print_warning "No ban records found in log file"
+        print_warning "No ban records found in log files"
     fi
 
     echo
@@ -418,41 +512,50 @@ display_recent_bans() {
 display_ban_history() {
     print_header "BAN HISTORY STATISTICS"
 
-    if [[ ! -f "$FAIL2BAN_LOG" ]]; then
-        print_error "Log file not found: $FAIL2BAN_LOG"
+    # Get log file count for display
+    local log_files
+    mapfile -t log_files < <(get_log_files)
+    local log_count=${#log_files[@]}
+
+    if [[ $log_count -eq 0 ]]; then
+        print_error "No log files found"
         return 1
     fi
 
-    local total_bans today_bans
-    total_bans=$(grep -c "Ban" "$FAIL2BAN_LOG" 2>/dev/null || echo "0")
-    today_bans=$(grep "Ban" "$FAIL2BAN_LOG" | grep -c "$(date +%Y-%m-%d)" 2>/dev/null || echo "0")
+    print_color "${COLOR_BOLD}" "Scanning ${COLOR_CYAN}${log_count}${COLOR_RESET} log file(s) for historical data"
+    echo
 
-    print_color "${COLOR_BOLD}" "Total Bans (all time):     ${COLOR_RED}${total_bans}"
-    print_color "${COLOR_BOLD}" "Bans Today:                ${COLOR_YELLOW}${today_bans}"
+    # Get all ban entries from all log files
+    local ban_entries
+    ban_entries=$(get_all_ban_entries)
+
+    if [[ -z "$ban_entries" ]]; then
+        print_warning "No ban records found in any log files"
+        return 0
+    fi
+
+    local total_bans today_bans
+    total_bans=$(echo "$ban_entries" | wc -l)
+    today_bans=$(echo "$ban_entries" | grep -c "$(date +%Y-%m-%d)" || echo "0")
+
+    print_color "${COLOR_BOLD}" "Total Bans (all scanned logs): ${COLOR_RED}${total_bans}"
+    print_color "${COLOR_BOLD}" "Bans Today:                    ${COLOR_YELLOW}${today_bans}"
 
     echo
     print_color "${COLOR_BOLD_CYAN}" "Top 10 Most Banned IPs:"
     print_color "${COLOR_BLUE}" "$(printf '%.0s─' {1..80})"
 
-    if grep -q "Ban" "$FAIL2BAN_LOG" 2>/dev/null; then
-        grep "Ban" "$FAIL2BAN_LOG" | grep -oP '\d+\.\d+\.\d+\.\d+' | sort | uniq -c | sort -rn | head -10 | while read -r count ip; do
-            print_color "${COLOR_WHITE}" "  ${COLOR_RED}$ip${COLOR_RESET} - ${COLOR_YELLOW}$count${COLOR_RESET} ban(s)"
-        done
-    else
-        print_warning "No ban records found"
-    fi
+    echo "$ban_entries" | grep -oP '\d+\.\d+\.\d+\.\d+' | sort | uniq -c | sort -rn | head -10 | while read -r count ip; do
+        print_color "${COLOR_WHITE}" "  ${COLOR_RED}$ip${COLOR_RESET} - ${COLOR_YELLOW}$count${COLOR_RESET} ban(s)"
+    done
 
     echo
     print_color "${COLOR_BOLD_CYAN}" "Bans by Jail:"
     print_color "${COLOR_BLUE}" "$(printf '%.0s─' {1..80})"
 
-    if grep -q "Ban" "$FAIL2BAN_LOG" 2>/dev/null; then
-        grep "Ban" "$FAIL2BAN_LOG" | grep -oP '\[\K[^\]]+(?=\])' | sort | uniq -c | sort -rn | while read -r count jail; do
-            print_color "${COLOR_WHITE}" "  ${COLOR_MAGENTA}$jail${COLOR_RESET} - ${COLOR_YELLOW}$count${COLOR_RESET} ban(s)"
-        done
-    else
-        print_warning "No ban records found"
-    fi
+    echo "$ban_entries" | grep -oP '\[\K[^\]]+(?=\])' | sort | uniq -c | sort -rn | while read -r count jail; do
+        print_color "${COLOR_WHITE}" "  ${COLOR_MAGENTA}$jail${COLOR_RESET} - ${COLOR_YELLOW}$count${COLOR_RESET} ban(s)"
+    done
 
     echo
 }
@@ -680,6 +783,8 @@ ${COLOR_BOLD}EXIT CODES:${COLOR_RESET}
 
 ${COLOR_BOLD}NOTES:${COLOR_RESET}
     - The script requires sudo/root access to query fail2ban status
+    - Scans up to ${MAX_LOG_FILES} log files (current + rotated) for historical data
+    - Supports both regular and compressed (.gz) rotated log files
     - Log file location may vary depending on your system configuration
     - Colors are automatically disabled when output is not a terminal
 

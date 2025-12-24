@@ -10,6 +10,7 @@ A comprehensive, user-friendly bash script for generating detailed fail2ban repo
 - **Detailed Jail Information** - Deep dive into specific jail configurations and stats
 - **Recent Ban History** - Shows recently banned IPs with timestamps
 - **Ban Statistics** - Historical data including top banned IPs and jail-specific statistics
+- **Multi-Log Scanning** - Automatically scans current and rotated log files (including .gz compressed)
 - **Export Capability** - Save reports to text files for documentation
 - **Color-Coded Output** - Enhanced readability with automatic color detection
 - **Flexible Options** - Combine multiple report sections as needed
@@ -122,7 +123,8 @@ nginx-limit-req      2               87              8               1256
 ### System Status
 - Fail2ban version
 - Service status
-- Log file location and size
+- Log file information (current and rotated files)
+- Number of log files being scanned
 
 ### Active Jails
 - Total active jails count
@@ -182,8 +184,41 @@ Exported reports include:
 The script uses the following default locations:
 - Log file: `/var/log/fail2ban.log`
 - Export directory: `/tmp/fail2ban-reports/`
+- Maximum log files: `5` (current + 4 rotated logs)
 
 These can be modified in the script configuration section if needed.
+
+## Log File Scanning
+
+The script automatically discovers and scans multiple log files for comprehensive historical data:
+
+### Supported Log Files
+- **Current log**: `/var/log/fail2ban.log`
+- **Rotated logs**: `fail2ban.log.1`, `fail2ban.log.2`, etc.
+- **Compressed logs**: `fail2ban.log.1.gz`, `fail2ban.log.2.gz`, etc.
+
+### How It Works
+1. Automatically detects up to 5 log files (configurable via `MAX_LOG_FILES`)
+2. Reads both regular and gzip-compressed rotated logs
+3. Combines data from all files for historical analysis
+4. Displays which log files are being scanned in the report
+
+### Benefits
+- **More complete ban history** - See bans from rotated logs
+- **Better statistics** - Top banned IPs across all available logs
+- **Historical trends** - Analyze patterns over longer time periods
+- **No manual work** - Automatically finds and processes all log files
+
+### Example Output
+```
+Log files:    5 file(s) found (max: 5)
+Main log:     /var/log/fail2ban.log (2.3M)
+Rotated logs: 4 file(s)
+              - fail2ban.log.1 (3.1M)
+              - fail2ban.log.2.gz (1.2M)
+              - fail2ban.log.3.gz (1.5M)
+              - fail2ban.log.4.gz (1.4M)
+```
 
 ## Exit Codes
 
